@@ -18,7 +18,7 @@
  * @return The trace (sum of diagonal values) of the matrix.
  */
 template <typename T>
-__global__ void trace_kernel(T *input, T *outputV, size_t diagonal_length, size_t cols)
+__global__ void trace_kernel_naive(T *input, T *outputV, size_t diagonal_length, size_t cols)
 {
   size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   int index = 0;
@@ -26,6 +26,40 @@ __global__ void trace_kernel(T *input, T *outputV, size_t diagonal_length, size_
   {
     index = idx * cols + idx;
     atomicAdd(outputV,input[index]);
+  }
+}
+
+template <typename T>
+__global__ void trace_kernel_smem(T *input, T *output, size_t diagonal_length, size_t cols)
+{
+  // extern __shared__ T sMem[];// compile error
+  extern __shared__ char shared_memory[];
+  T* sMem = reinterpret_cast<T*>(shared_memory);
+
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int index = 0;
+  // load2smem
+  size_t tid = threadIdx.x;
+  sMem[tid] = T(0);
+
+  if (idx < diagonal_length)
+  {
+    index = idx * cols + idx;
+    sMem[tid] = input[index]; // idx lead2 illegal memory access
+  }
+   __syncthreads();
+  // reduce
+  for(unsigned int i = blockDim.x / 2; i>0; i>>=1){
+    if(tid<i){
+      sMem[tid]+=sMem[tid+i];
+    }
+    __syncthreads();
+  }
+  // if (tid == 0) {// cannot process multi block for large matrix
+  //   *output = sMem[0];
+  // }
+  if (tid == 0) {
+      atomicAdd(output, sMem[0]);
   }
 }
 
@@ -56,7 +90,9 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   // kernel call
   dim3 block(1024, 1);
   dim3 grid((diagonal_length - 1) / block.x + 1, 1);
-  trace_kernel<<<grid,block>>>(d_input, d_output, diagonal_length, cols);
+
+  size_t sMem_size = 1024 * sizeof(T);
+  trace_kernel_smem<<<grid,block,sMem_size>>>(d_input, d_output, diagonal_length, cols);
   cudaDeviceSynchronize();
   
   // get result
