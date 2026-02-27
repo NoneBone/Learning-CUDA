@@ -20,7 +20,16 @@
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   // TODO: Implement the trace function
-  return T(-1);
+  int diagonal_length = min(rows, cols);
+
+  T trace_value = T(0);
+  int index = 0;
+  for (int i=0;i <diagonal_length;i++){
+      index = i * cols + i;
+      trace_value += h_input[index];
+  }
+
+  return T(trace_value);
 }
 
 /**

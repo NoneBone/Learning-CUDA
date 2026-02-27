@@ -19,9 +19,10 @@ EXTRA_LIBS     	:=
 
 # Compiler & Tester object selection based on PLATFORM
 ifeq ($(PLATFORM),nvidia)
-    CC          	:= nvcc
+    CC          	:= /usr/local/cuda-12.8/bin/nvcc
     TEST_OBJ    	:= tester/tester_nv.o
 	PLATFORM_DEFINE := -DPLATFORM_NVIDIA
+	EXTRA_LIBS  := /usr/local/cuda-12.8/lib64/libcudart.so -L/usr/lib/gcc/x86_64-linux-gnu/11 -lstdc++
 else ifeq ($(PLATFORM),iluvatar)
     CC          	:= clang++
 	CFLAGS          := -std=c++17 -O3
