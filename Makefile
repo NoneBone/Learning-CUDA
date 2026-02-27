@@ -22,7 +22,7 @@ ifeq ($(PLATFORM),nvidia)
     CC          	:= /usr/local/cuda-12.8/bin/nvcc
     TEST_OBJ    	:= tester/tester_nv.o
 	PLATFORM_DEFINE := -DPLATFORM_NVIDIA
-	EXTRA_LIBS  := /usr/local/cuda-12.8/lib64/libcudart.so -L/usr/lib/gcc/x86_64-linux-gnu/11 -lstdc++
+	EXTRA_LIBS  := /usr/local/cuda-12.8/lib64/libcudart.so -L/usr/lib/gcc/x86_64-linux-gnu/11 -lstdc++ -lineinfo
 else ifeq ($(PLATFORM),iluvatar)
     CC          	:= clang++
 	CFLAGS          := -std=c++17 -O3
@@ -101,4 +101,4 @@ $(TARGET): $(STUDENT_OBJ) $(TEST_OBJ)
 # Generate src object: Compile kernels.cu (triggers template instantiation)
 $(STUDENT_OBJ): $(STUDENT_SRC)
 	@echo "=== Compiling student code ($(STUDENT_SRC)) ==="
-	$(CC) $(CFLAGS) $(PLATFORM_DEFINE) -c $< -o $@
+	$(CC) $(CFLAGS) $(PLATFORM_DEFINE) -c $< -o $@ -lineinfo

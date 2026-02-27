@@ -92,7 +92,11 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   dim3 grid((diagonal_length - 1) / block.x + 1, 1);
 
   size_t sMem_size = 1024 * sizeof(T);
+#if 1
+  trace_kernel_naive<<<grid,block>>>(d_input, d_output, diagonal_length, cols); // greater
+#elif 1
   trace_kernel_smem<<<grid,block,sMem_size>>>(d_input, d_output, diagonal_length, cols);
+#endif
   cudaDeviceSynchronize();
   
   // get result
