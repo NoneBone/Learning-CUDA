@@ -18,17 +18,50 @@
  * @return The trace (sum of diagonal values) of the matrix.
  */
 template <typename T>
+__global__ void trace_kernel(T *input, T *outputV, size_t diagonal_length, size_t cols)
+{
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int index = 0;
+  if (idx < diagonal_length)
+  {
+    index = idx * cols + idx;
+    atomicAdd(outputV,input[index]);
+  }
+}
+
+template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   // TODO: Implement the trace function
   int diagonal_length = min(rows, cols);
 
   T trace_value = T(0);
+#if 0
   int index = 0;
   for (int i=0;i <diagonal_length;i++){
       index = i * cols + i;
       trace_value += h_input[index];
   }
+#elif 1
+  // mem alloc
+  int matrix_length = rows * cols;
+  T *d_input;
+  cudaMalloc((void**)&d_input, matrix_length*sizeof(T));
+  cudaMemcpy(d_input,h_input.data(), matrix_length*sizeof(T),cudaMemcpyHostToDevice);
 
+  T *d_output;
+  cudaMalloc((void**)&d_output, sizeof(T));
+  T zero = T(0);
+  cudaMemcpy(d_output, &zero, sizeof(T), cudaMemcpyHostToDevice);
+  
+  // kernel call
+  dim3 block(1024, 1);
+  dim3 grid((diagonal_length - 1) / block.x + 1, 1);
+  trace_kernel<<<grid,block>>>(d_input, d_output, diagonal_length, cols);
+  cudaDeviceSynchronize();
+  
+  // get result
+  cudaMemcpy(&trace_value, d_output, sizeof(T), cudaMemcpyDeviceToHost);
+#endif
   return T(trace_value);
 }
 
