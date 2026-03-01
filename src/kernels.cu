@@ -147,12 +147,12 @@ template <int Br, int Bc, typename T>
 __global__ void flash_fwd_kernel(const T *Q, const T *K, const T *V, T *O, int batch_size, int target_seq_len, int src_seq_len, int query_heads, int kv_heads,
                                  int head_dim, bool is_causal)
 {
-  int batch_Idx = blockIdx.x;
-  int query_head_Idx = blockIdx.y;
-  int tile_Idx = blockIdx.z;
-  int thread_Idx = threadIdx.x;
+  int batch_idx = blockIdx.x;
+  int query_head_idx = blockIdx.y;
+  int tile_idx = blockIdx.z;
+  int thread_idx = threadIdx.x;
 
-  int kv_head_idx = query_head_Idx / ((int) query_heads/kv_heads); // GQA
+  int kv_head_idx = query_head_idx / ((int) query_heads/kv_heads); // GQA
 
   extern __shared__ char shared_mem[];
   T *q_tile = reinterpret_cast<T *>(&shared_mem[0]);
@@ -161,36 +161,39 @@ __global__ void flash_fwd_kernel(const T *Q, const T *K, const T *V, T *O, int b
 
   // load Q and KV to smem
   // Q  : [batch_size, target_seq_len, query_heads, head_dim]
-  const int q_block_start_row = tile_Idx * Br;
-  const int stride_q_batch = (int)target_seq_len * query_heads * head_dim;
-  const int stride_q_seq = (int)query_heads * head_dim;
-  const int stride_q_head = (int)head_dim;
+  const int stride_q_batch = target_seq_len * query_heads * head_dim;
+  const int stride_q_seq = query_heads * head_dim;
+  const int stride_q_head = head_dim;
   // KV : [batch_size, src_seq_len, kv_heads, head_dim]
-  const int stride_kv_batch = (int)src_seq_len * kv_heads * head_dim;
-  const int stride_kv_seq = (int)kv_heads * head_dim;
-  const int stride_kv_head = (int)head_dim;
+  const int stride_kv_batch = src_seq_len * kv_heads * head_dim;
+  const int stride_kv_seq = kv_heads * head_dim;
+  const int stride_kv_head = head_dim;
 
   // batch bias
-  Q += batch_Idx * stride_q_batch;
-  O += batch_Idx * stride_q_batch;
-  K += batch_Idx * stride_kv_batch;
-  V += batch_Idx * stride_kv_batch;
+  const T* Q_batch = Q + batch_idx * stride_q_batch;
+  T* O_batch = O + batch_idx * stride_q_batch;
+  const T* K_batch = K + batch_idx * stride_kv_batch;
+  const T* V_batch = V + batch_idx * stride_kv_batch;
+
+  // 查询块起始行
+  const int q_block_start_row = tile_idx * Br;
+  int q_global_row = q_block_start_row + thread_idx;
+  
   // o, l, m
-  T o_i[256];
+  T o_i[256] = {static_cast<T>(0)};
   T m_i = static_cast<T>(-1e10);
   T l_i = static_cast<T>(0);
-  for(int d = 0;d<head_dim;d++){
-      o_i[d] = static_cast<T>(0);
-  }
 
-  for (int i = thread_Idx; i < Br * head_dim; i += Br)
+  // 加载查询块到共享内存
+  for (int i = thread_idx; i < Br * head_dim; i += blockDim.x)
   {
     int row = i / head_dim;
     int col = i % head_dim;
     int global_row_q = q_block_start_row + row;
     if (row < Br && global_row_q < target_seq_len)
     {
-      q_tile[row * head_dim + col] = Q[global_row_q * stride_q_seq + query_head_Idx * stride_q_head];
+      int offset = global_row_q * stride_q_seq + query_head_idx * stride_q_head + col;
+      q_tile[row * head_dim + col] = Q_batch[offset];
     }
     else
     {
@@ -199,17 +202,25 @@ __global__ void flash_fwd_kernel(const T *Q, const T *K, const T *V, T *O, int b
   }
   __syncthreads();
 
+  // 检查当前线程是否有效的查询行
+  if (thread_idx >= Br || q_global_row >= target_seq_len) {
+    return;  // 无效线程提前返回
+  }
+
+  // 循环遍历键值块
   for (int col_block_start = 0; col_block_start < src_seq_len; col_block_start += Bc)
-  { // 外层循环
-    for (int i = thread_Idx; i < Bc * head_dim; i += Bc)
-    { // load KV
+  {
+    // 加载键值块到共享内存
+    for (int i = thread_idx; i < Bc * head_dim; i += blockDim.x)
+    {
       int row = i / head_dim;
       int col = i % head_dim;
       int global_row_kv = col_block_start + row;
       if (row < Bc && global_row_kv < src_seq_len)
       {
-        k_tile[row * head_dim + col] = K[global_row_kv * stride_kv_seq + kv_head_idx * stride_kv_head + col];
-        v_tile[row * head_dim + col] = V[global_row_kv * stride_kv_seq + kv_head_idx * stride_kv_head + col];
+        int kv_offset = global_row_kv * stride_kv_seq + kv_head_idx * stride_kv_head + col;
+        k_tile[row * head_dim + col] = K_batch[kv_offset];
+        v_tile[row * head_dim + col] = V_batch[kv_offset];
       }
       else
       {
@@ -218,89 +229,114 @@ __global__ void flash_fwd_kernel(const T *Q, const T *K, const T *V, T *O, int b
       }
     }
     __syncthreads();
-    // 计算S_ij = Q_i @ K_j^T，加上应用因果mask
+
+    // 注意力分数 S_ij = Q_i @ K_j^T
     T s_score[Bc] = {static_cast<T>(0)};
-    T scale = static_cast<T>(1.0);// self-attention中常用的缩放因子
+    
+    // 计算缩放因子 self-attention
+    T scale = static_cast<T>(1.0);
     if constexpr (std::is_same_v<T, float>) {
         scale = rsqrtf(static_cast<float>(head_dim));
     } else if constexpr (std::is_same_v<T, half>) {
         scale = hrsqrt(__float2half(static_cast<float>(head_dim)));
     }
-    int q_local_row = thread_Idx;
-    int q_global_row = q_block_start_row + q_local_row;
-    if (q_local_row >= Br || q_global_row >= target_seq_len)
-        continue;
 
+    // 计算查询与所有键的点积
     for (int k_local_col = 0; k_local_col < Bc; ++k_local_col) {
       T dot_sum = static_cast<T>(0);
       for (int d = 0; d < head_dim; ++d) {
-        dot_sum += q_tile[q_local_row * head_dim + d] * k_tile[k_local_col * head_dim + d];
+        T q_val = q_tile[thread_idx * head_dim + d];
+        T k_val = k_tile[k_local_col * head_dim + d];
+        dot_sum += q_val * k_val;
       }
       s_score[k_local_col] = dot_sum * scale;
 
-      // 应用因果mask
+      // 应用mask
       int k_global_col = col_block_start + k_local_col;
-      if(k_global_col >= src_seq_len){
-        s_score[k_local_col] = static_cast<T>(-1e10);
-      }
-      if (is_causal && q_global_row < k_global_col) {
-        s_score[k_local_col] = static_cast<T>(-1e10);
-      }
-    }
-    
-    // online 计算P_ij = softmax(S_ij) ???
-    for (int i = 0; i < 1; ++i) {
-      q_local_row = thread_Idx;
-      q_global_row = q_block_start_row + q_local_row;
-      if (q_local_row >= Br || q_global_row >= target_seq_len)
-          continue;
-      // 1. 计算每行最大值m_block_ij
-      T m_block = static_cast<T>(-1e10);
-      for(int k = 0;k<Bc;k++){
-        if(s_score[k] > m_block){
-          m_block = s_score[k];
-        }
-      }
-      if (m_block == static_cast<T>(-1e10)) {
-        continue;
-      }
-      // 计算新的mi
-      T m_new = (m_block > m_i) ? m_block : m_i;
-      // 2. 计算exp(S_ij - m_block_ij)和l_block_ij
-      ////////////////////// death loop ///////////////////////////////////
-      T l_block = static_cast<T>(0);
-      for(int k = 0;k<Bc;k++){
-        s_score[k] = exp_fp16(s_score[k] - m_new);
-        l_block += s_score[k];
-      }
-      // 计算新的li
-      T l_new = l_i * exp_fp16(m_i - m_new) + l_block;
+      bool is_masked = false;
       
-      // 更新o_i
-      T weight_o_i = (l_new == static_cast<T>(0)) ? static_cast<T>(0) : (l_i * exp_fp16(m_i - m_new) / l_new);
-      for(int d = 0;d<head_dim;d++){
-        o_i[d] *= weight_o_i;
+      if (k_global_col >= src_seq_len) {
+        is_masked = true;
+      } else if (is_causal && q_global_row < k_global_col) {
+        is_masked = true;
       }
-      // 合并到最终输出
+      
+      if (is_masked) {
+        s_score[k_local_col] = static_cast<T>(-1e10);
+      }
+    }
+
+    // 在线softmax计算 P_ij = softmax(S_ij)
+    // 1. 计算当前块的最大值
+    T m_block = static_cast<T>(-1e10);
+    for (int k = 0; k < Bc; ++k) {
+      if (s_score[k] > m_block) {
+        m_block = s_score[k];
+      }
+    }
+
+    // 如果所有分数都被masked，跳过这个块
+    if (m_block == static_cast<T>(-1e10)) {
+      __syncthreads();
+      continue;
+    }
+
+    // 2. 更新全局最大值
+    T m_new = (m_block > m_i) ? m_block : m_i;
+
+    // 3. 计算exp(s - m_new)和块内的sum
+    T l_block = static_cast<T>(0);
+    for (int k = 0; k < Bc; ++k) {
+      if (s_score[k] > static_cast<T>(-1e9)) {  // 避免被masked的值
+        T val = exp_fp16(s_score[k] - m_new);
+        s_score[k] = val;  // 存储exp后的值
+        l_block += val;
+      } else {
+        s_score[k] = static_cast<T>(0);
+      }
+    }
+
+    // 4. 更新全局sum
+    T exp_old = (l_i > static_cast<T>(0)) ? exp_fp16(m_i - m_new) : static_cast<T>(0);
+    T l_new = l_i * exp_old + l_block;
+
+    // 5. 重新缩放旧的输出累加
+    if (l_new > static_cast<T>(0)) {
+      T scale_factor = (l_i * exp_old) / l_new;
+      for (int d = 0; d < head_dim; ++d) {
+        o_i[d] *= scale_factor;
+      }
+    } else {
+      for (int d = 0; d < head_dim; ++d) {
+        o_i[d] = static_cast<T>(0);
+      }
+    }
+
+    // 6. 添加当前块的贡献
+    if (l_new > static_cast<T>(0)) {
+      T inv_l_new = static_cast<T>(1.0) / l_new;
       for (int k = 0; k < Bc; ++k) {
-        T p_i = s_score[k];
-        for(int d = 0;d<head_dim;d++){
-          o_i[d] += (l_new == static_cast<T>(0)) ? static_cast<T>(0) : (p_i * v_tile[k * head_dim + d] / l_new);
+        T p_val = s_score[k];
+        if (p_val > static_cast<T>(0)) {
+          for (int d = 0; d < head_dim; ++d) {
+            o_i[d] += p_val * v_tile[k * head_dim + d] * inv_l_new;
+          }
         }
       }
-      /////////////////////////////////////////////////////////
-      // 更新全局l和m
-      l_i = l_new;
-      m_i = m_new;
     }
-  __syncthreads();
+
+    // 7. 更新全局状态
+    l_i = l_new;
+    m_i = m_new;
+    
+    __syncthreads();
   }
+
   // 写回全局内存
-  int q_local_row = thread_Idx;
-  int q_global_row = q_block_start_row + q_local_row;
-  if (q_local_row < Br && q_global_row < target_seq_len){
-      for(int d = 0;d<head_dim;d++){
-      O[q_global_row * stride_q_seq + query_head_Idx * stride_q_head + d] = o_i[d];
+  if (q_global_row < target_seq_len) {
+    int offset = q_global_row * stride_q_seq + query_head_idx * stride_q_head;
+    for (int d = 0; d < head_dim; ++d) {
+      O_batch[offset + d] = o_i[d];
     }
   }
 }
